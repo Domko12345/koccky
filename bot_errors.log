@@ -1014,3 +1014,68 @@ KeyboardInterrupt
     return sum(_matches(d, face) for hand in shown for d in hand)
                ~~~~~~~~^^^^^^^^^
 KeyboardInterrupt
+Traceback (most recent call last):
+  File "C:\Users\domin\Downloads\koccky-main-upravene\koccky-main\bot_runner.py", line 6, in <module>
+    for line in sys.stdin:
+                ^^^^^^^^^
+  File "C:\Users\domin\AppData\Local\Python\pythoncore-3.14-64\Lib\encodings\cp1252.py", line 22, in decode
+    def decode(self, input, final=False):
+    
+KeyboardInterrupt
+che, next_call_cache)
+  File "C:\Users\domin\Downloads\koccky-main-upravene\koccky-main\bots\liars_dice_EV_dynamic.py", line 213, in __init__
+    self.histograms = reroll_distributions(self.n, roll_cache) if math.comb(self.n+5, 5) <= MAX_EXACT_OPPONENT_HANDS else None
+                      ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\domin\Downloads\koccky-main-upravene\koccky-main\bots\liars_dice_EV_dynamic.py", line 188, in reroll_distributions
+    generate(number, 1, [], 1)
+    ~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "C:\Users\domin\Downloads\koccky-main-upravene\koccky-main\bots\liars_dice_EV_dynamic.py", line 186, in generate
+    generate(remaining - amount, face + 1,
+    ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+             counts + [amount], denominator * factorial[amount])
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\domin\Downloads\koccky-main-upravene\koccky-main\bots\liars_dice_EV_dynamic.py", line 186, in generate
+    generate(remaining - amount, face + 1,
+    ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+             counts + [amount], denominator * factorial[amount])
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\domin\Downloads\koccky-main-upravene\koccky-main\bots\liars_dice_EV_dynamic.py", line 186, in generate
+    generate(remaining - amount, face + 1,
+    ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+             counts + [amount], denominator * factorial[amount])
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  [Previous line repeated 2 more times]
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "C:\Users\domin\Downloads\koccky-main-upravene\koccky-main\bot_runner.py", line 6, in <module>
+    for line in sys.stdin:
+                ^^^^^^^^^
+  File "C:\Users\domin\AppData\Local\Python\pythoncore-3.14-64\Lib\encodings\cp1252.py", line 22, in decode
+    def decode(self, input, final=False):
+    
+KeyboardInterrupt
+count, face, matches)
+    ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        for count in legal_by_face[face])
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\domin\Downloads\koccky-main-upravene\koccky-main\bots\liars_dice_EV_dynamic.py", line 445, in <genexpr>
+    max(future_model.bid_value(count, face, matches)
+        ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\domin\Downloads\koccky-main-upravene\koccky-main\bots\liars_dice_EV_dynamic.py", line 340, in bid_value
+    value = sum(
+        weight * other_stats.bid_value(need - k, reward, loss, elimination_penalty(self.s))
+        for k, weight in enumerate(weights)
+    )
+  File "C:\Users\domin\Downloads\koccky-main-upravene\koccky-main\bots\liars_dice_EV_dynamic.py", line 341, in <genexpr>
+    weight * other_stats.bid_value(need - k, reward, loss, elimination_penalty(self.s))
+             ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\domin\Downloads\koccky-main-upravene\koccky-main\bots\liars_dice_EV_dynamic.py", line 164, in bid_value
+    - self.expected_loss(need, own_loss_cap)
+      ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\domin\Downloads\koccky-main-upravene\koccky-main\bots\liars_dice_EV_dynamic.py", line 157, in expected_loss
+    + need * (self._cdf(need) - self._cdf(a))
+              ~~~~~~~~~^^^^^^
+  File "C:\Users\domin\Downloads\koccky-main-upravene\koccky-main\bots\liars_dice_EV_dynamic.py", line 145, in _cdf
+    def _cdf(self, threshold):
+    
+KeyboardInterrupt

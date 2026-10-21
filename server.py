@@ -1,9 +1,10 @@
-import gzip, hashlib, hmac, json, os, queue, random, re, secrets, sqlite3, subprocess, sys, threading, time
+import gzip, hashlib, hmac, json, os, queue, random, re, secrets, sqlite3, subprocess, sys, tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from engine import Game
 import math
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.cookies import SimpleCookie
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -285,22 +286,193 @@ def profile(user):
                 admin=user["id"] == 1)
 
 
+# No uploaded Python source is executed by the host Python interpreter.
+# Each bot is confined to its own disposable, locked-down Linux container.
+# REQUIREMENT: Docker Desktop with Linux containers, plus a locally pulled image.
+BOT_IMAGE = os.environ.get("KOCKY_BOT_IMAGE", "python:3.12-slim")
+DOCKER = os.environ.get("KOCKY_DOCKER", "docker")
+BOT_START_TIMEOUT = 25.0       # time to start a container and import the bot
+BOT_MOVE_TIMEOUT = 3.0         # decision time, excluding container startup
+MAX_BOT_REPLY = 4096           # bytes per protocol line
+SANDBOX_RETRY_SECONDS = 20
+# Also cap authenticated users' ability to consume Docker worker resources.
+MAX_ACTIVE_GAMES = 6
+MAX_ACTIVE_GAMES_PER_USER = 2
+MAX_CONCURRENT_BOTS = 20
+sandbox_retry_after = 0.0
+
+
+class SandboxError(RuntimeError):
+    pass
+
+
+def check_docker_sandbox():
+    """Fail CLOSED; never fall back to executing uploaded code on the host."""
+    try:
+        info = subprocess.run([DOCKER, "info", "--format", "{{.OSType}}"],
+                              capture_output=True, text=True, timeout=12, check=True)
+        if info.stdout.strip() != "linux":
+            raise SandboxError("Docker musi bezat v rezime Linux containers.")
+        image = subprocess.run([DOCKER, "image", "inspect", BOT_IMAGE],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                               text=True, timeout=12)
+        if image.returncode:
+            raise SandboxError(f"Chyba Docker image {BOT_IMAGE}; spusti: docker pull {BOT_IMAGE}")
+        if not os.path.isfile(os.path.join(ROOT, "bot_runner.py")):
+            raise SandboxError("Chyba subor bot_runner.py v priecinku projektu.")
+    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+        raise SandboxError("Docker nie je spusteny alebo dostupny. Spusti Docker Desktop (Linux containers).") from exc
+
+
+def validate_bot_action(action, state):
+    """Validate shape AND legality before passing anything to the game engine."""
+    if type(action) is not dict:
+        raise ValueError("Bot must return a JSON object")
+    kind = action.get("action")
+    if kind == "call":
+        if set(action) != {"action"} or not state["can_call"]:
+            raise ValueError("Invalid call")
+    elif kind == "bid":
+        if (set(action) != {"action", "count", "face"}
+                or type(action["count"]) is not int or type(action["face"]) is not int
+                or [action["count"], action["face"]] not in state["legal_bids"]):
+            raise ValueError("Invalid bid")
+    elif kind == "reveal":
+        indices = action.get("indices")
+        if (set(action) != {"action", "indices"} or type(indices) is not list
+                or not indices or len(indices) > len(state["your_dice"])
+                or any(type(i) is not int or i < 0 or i >= len(state["your_dice"]) for i in indices)
+                or len(set(indices)) != len(indices)
+                or state["must_raise"] or not state["legal_bids"]):
+            raise ValueError("Invalid reveal")
+    else:
+        raise ValueError("Unknown bot action")
+    return action
+
+
 class BotProc:
+    """One persistent container per bot per game. Never executes bot code locally."""
     def __init__(self, name):
-        self.p = subprocess.Popen([sys.executable, os.path.join(ROOT, "bot_runner.py"), os.path.join(BOTS, name + ".py")],
-                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=open(os.path.join(ROOT, "bot_errors.log"), "a"), text=True, bufsize=1)
-        self.q = queue.Queue()
-        threading.Thread(target=lambda: [self.q.put(l) for l in self.p.stdout], daemon=True).start()
-    def ask(self, state, t=3.0):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,90}", name):
+            raise SandboxError("Invalid bot name")
+        source = os.path.abspath(os.path.join(BOTS, name + ".py"))
+        bot_dir = os.path.realpath(BOTS)
+        if (os.path.islink(source) or not os.path.isfile(source)
+                or os.path.realpath(os.path.dirname(source)) != bot_dir):
+            raise SandboxError("Bot file missing or unsafe")
+        runner = os.path.abspath(os.path.join(ROOT, "bot_runner.py"))
+        if not os.path.isfile(runner):
+            raise SandboxError("Missing bot_runner.py")
+        # Docker's --mount syntax uses commas as separators. Reject ambiguous paths.
+        if any(c in source + runner for c in (",", "\n", "\r")):
+            raise SandboxError("Folder paths must not contain commas or line breaks")
+
+        self.container = "kocky-bot-" + secrets.token_hex(12)
+        self.q = queue.Queue(maxsize=2)
+        self.problem = None
+        self.closed = False
+        self.p = None
+        args = [
+            DOCKER, "run", "--rm", "-i", "--pull=never", "--name", self.container,
+            "--network=none", "--read-only", "--cap-drop=ALL",
+            "--security-opt=no-new-privileges", "--user=65534:65534",
+            "--pids-limit=16", "--memory=256m", "--memory-swap=256m",
+            "--cpus=1.0", "--ulimit=nofile=64:64", "--shm-size=8m",
+            "--log-driver=none", "--tmpfs=/tmp:rw,nosuid,nodev,noexec,size=16m,mode=1777",
+            "--workdir=/tmp", "--env=PYTHONDONTWRITEBYTECODE=1",
+            "--mount", f"type=bind,source={source},target=/sandbox/bot.py,readonly",
+            "--mount", f"type=bind,source={runner},target=/sandbox/runner.py,readonly",
+            BOT_IMAGE, "python", "-I", "-B", "-u", "/sandbox/runner.py", "/sandbox/bot.py"
+        ]
         try:
-            self.p.stdin.write(json.dumps(state) + "\n"); self.p.stdin.flush()
-            return json.loads(self.q.get(timeout=t))
-        except Exception as e:
-            self.close(); return {"error": repr(e)}
+            self.p = subprocess.Popen(args, stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                      bufsize=0)
+            threading.Thread(target=self._read, name="sandbox-stdout", daemon=True).start()
+            ready = self._recv(BOT_START_TIMEOUT)
+            if ready != {"status": "ready"}:
+                raise SandboxError("Bot import/sandbox startup failed")
+        except Exception as exc:
+            self.close()
+            if isinstance(exc, SandboxError):
+                raise
+            raise SandboxError("Failed to launch bot sandbox: " + type(exc).__name__) from exc
+
+    def _read(self):
+        try:
+            while True:
+                line = self.p.stdout.readline(MAX_BOT_REPLY + 1)
+                if not line:
+                    self.q.put_nowait(None) if not self.q.full() else None
+                    return
+                if len(line) > MAX_BOT_REPLY or not line.endswith(b"\n"):
+                    self.problem = "Bot response exceeded size limit"
+                    self.p.kill()
+                    return
+                try:
+                    self.q.put_nowait(line)
+                except queue.Full:
+                    self.problem = "Bot sent unsolicited/flooded responses"
+                    self.p.kill()
+                    return
+        except (OSError, ValueError):
+            self.problem = "Bot protocol stream failed"
+
+    def _recv(self, timeout):
+        try:
+            raw = self.q.get(timeout=timeout)
+        except queue.Empty as exc:
+            raise SandboxError(self.problem or "Bot timed out") from exc
+        if raw is None or self.problem:
+            raise SandboxError(self.problem or "Bot process exited")
+        try:
+            return json.loads(raw)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise SandboxError("Invalid JSON from bot") from exc
+
+    def ask(self, state, t=BOT_MOVE_TIMEOUT):
+        if self.closed:
+            return {"error": "Bot sandbox is no longer running"}
+        try:
+            payload = json.dumps(state, separators=(",", ":"), allow_nan=False).encode("utf-8") + b"\n"
+            if len(payload) > 262144:
+                raise SandboxError("State too large")
+            self.p.stdin.write(payload)
+            self.p.stdin.flush()
+            return validate_bot_action(self._recv(t), state)
+        except (OSError, BrokenPipeError, ValueError, SandboxError) as exc:
+            self.close()
+            return {"error": str(exc)[:120]}
+
     def close(self):
-        try: self.p.kill()
-        except Exception: pass
+        if self.closed:
+            return
+        self.closed = True
+        if self.p is None:
+            return
+        try:
+            self.p.stdin.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            self.p.wait(timeout=0.35)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        # Killing the Docker CLI alone may leave the container running.
+        # Force-remove by the unguessable container name (no user-controlled name).
+        try:
+            subprocess.run([DOCKER, "rm", "--force", self.container],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=5, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        try:
+            self.p.kill()
+            self.p.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
 
 def fallback(v):
     if v["can_call"]: return {"action": "call"}
@@ -412,9 +584,24 @@ def replay_frame(g, action=None):
                 log=g.log[-60:].copy(), action=action)
 
 def run_game(gid):
+    global sandbox_retry_after
     m = games[gid]; g, h = m["game"], m["human"]
-    procs = {i: BotProc(n) for i, n in enumerate(m["names"]) if i != h}
+    procs = {}
+    completed = False
     try:
+        # Docker Desktop startup is relatively expensive; initialize workers
+        # concurrently without ever sharing code or files between containers.
+        competitors = [(i, n) for i, n in enumerate(m["names"]) if i != h]
+        errors = []
+        with ThreadPoolExecutor(max_workers=min(6, len(competitors))) as pool:
+            futures = {pool.submit(BotProc, n): i for i, n in competitors}
+            for future in as_completed(futures):
+                try:
+                    procs[futures[future]] = future.result()
+                except SandboxError as exc:
+                    errors.append(exc)
+        if errors:
+            raise errors[0]
         while g.winner is None:
             i = g.turn
             if i == h:
@@ -441,9 +628,19 @@ def run_game(gid):
                 if m["frames"] is not None:
                     m["frames"].append(replay_frame(g, dict(bot=g.names[i], response=a, note=note)))
         if not m.get("debug") and h is None: finish(m)  # Human/debug games do not affect rankings.
-        m["status"] = "finished"
+        completed = True
+    except SandboxError as exc:
+        sandbox_retry_after = time.monotonic() + SANDBOX_RETRY_SECONDS
+        m["status"] = "error"
+        print("Bot sandbox failed:", str(exc), file=sys.stderr)
+    except Exception as exc:
+        m["status"] = "error"
+        print("Game error:", repr(exc), file=sys.stderr)
     finally:
         for p in procs.values(): p.close()
+        if completed:
+            # Keep the match running until all Docker workers have exited.
+            m["status"] = "finished"
 
 def start(opp=None, human=False, pick=None, dice=None, chosen_bots=None, league="noncompetitive", owner_id=None):
     """Create a game. In human games choose 1-9 specific or random opponents.
@@ -489,6 +686,13 @@ def start(opp=None, human=False, pick=None, dice=None, chosen_bots=None, league=
     gid = str(time.time_ns())
     g = Game(names, dice)
     with lock:
+        active = [m for m in games.values() if m["status"] == "running"]
+        active_workers = sum(len(m["names"]) - (m["human"] is not None) for m in active)
+        needed_workers = len(names) - int(human)
+        if len(active) >= MAX_ACTIVE_GAMES or active_workers + needed_workers > MAX_CONCURRENT_BOTS:
+            raise ValueError("Server ma teraz privela beziach hier; skus neskor.")
+        if owner_id is not None and sum(m.get("owner_id") == owner_id for m in active) >= MAX_ACTIVE_GAMES_PER_USER:
+            raise ValueError("Mozes mat najviac dve aktivne vlastne hry naraz.")
         games[gid] = dict(id=gid, names=names, human=names.index("You") if human else None, owner_id=owner_id, league=league, status="running",
                           lock=threading.Lock(), game=g, dice=dice, t=time.time(), last_act=time.time(),
                           debug=bool(pick), go=threading.Event(),
@@ -501,6 +705,9 @@ def start(opp=None, human=False, pick=None, dice=None, chosen_bots=None, league=
 def scheduler():
     previous = "noncompetitive"
     while True:
+        if time.monotonic() < sandbox_retry_after:
+            time.sleep(1)
+            continue
         with lock:
             running = any(m["status"] == "running" and m["human"] is None and not m["debug"]
                           and m.get("auto_scheduled", False) for m in games.values())
@@ -508,7 +715,10 @@ def scheduler():
             available = [tier for tier in ("competitive", "noncompetitive") if len(bots(tier)) >= 2]
             if available:
                 tier = next((tier for tier in available if tier != previous), available[0])
-                gid = start(league=tier)
+                try:
+                    gid = start(league=tier)
+                except ValueError:
+                    gid = None  # All sandbox worker slots are currently in use.
                 if gid:
                     with lock:
                         games[gid]["auto_scheduled"] = True
@@ -758,10 +968,69 @@ class H(BaseHTTPRequestHandler):
             return self.reply({"error": "Interná chyba servera."}, 500)
 
 
+def sandbox_selftest():
+    """Run a benign probe in a REAL container; never execute this probe on the host."""
+    global BOTS
+    script = '''def decide(state):
+    import os, socket
+    # Other bots, the project database, and host files were NOT mounted.
+    for path in ("/sandbox/other_bot.py", "/sandbox/server.py",
+                 "/sandbox/accounts.sqlite3", "/host/etc/passwd"):
+        try:
+            with open(path, "rb") as f: f.read(1)
+            return {"action": "unsafe_read"}
+        except OSError:
+            pass
+    # Neither our own source nor container OS files may be modified.
+    for path in ("/sandbox/bot.py", "/sandbox/runner.py", "/etc/passwd"):
+        try:
+            with open(path, "ab") as f: f.write(b"x")
+            return {"action": "unsafe_write"}
+        except OSError:
+            pass
+    # With --network=none, only the local loopback interface is visible.
+    if sorted(name for _, name in socket.if_nameindex()) != ["lo"]:
+        return {"action": "unsafe_network"}
+    count, face = state["legal_bids"][0]
+    return {"action": "bid", "count": count, "face": face}
+'''
+    with tempfile.TemporaryDirectory(prefix="kocky-sandbox-test-") as tempdir:
+        name = "sandbox_probe"
+        with open(os.path.join(tempdir, name + ".py"), "w", encoding="utf-8") as file:
+            file.write(script)
+        old_bot_dir = BOTS
+        BOTS = tempdir
+        try:
+            probe = BotProc(name)
+            try:
+                from engine import Game
+                state = Game([name, "other"], dice=2, seed=1).view(0)
+                response = probe.ask(state)
+                validate_bot_action(response, state)
+                if response["action"] != "bid":
+                    raise SandboxError("Sandbox probe did not return the expected action")
+            finally:
+                probe.close()
+        finally:
+            BOTS = old_bot_dir
+    print("Sandbox test PASS: no host-project reads, no writes, no external network.")
+
+
 if __name__ == "__main__":
+    if len(sys.argv) == 2 and sys.argv[1] == "--check-sandbox":
+        try:
+            check_docker_sandbox()
+            sandbox_selftest()
+        except (SandboxError, ValueError) as exc:
+            raise SystemExit("Sandbox test FAILED: " + str(exc))
+        raise SystemExit(0)
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
+    try:
+        check_docker_sandbox()
+    except SandboxError as exc:
+        raise SystemExit("BEZPECNOST: " + str(exc) + "\nNespustam server, lebo boti nesmu bezat mimo sandboxu.")
     print("Registračný kód (zdieľaj iba s dôveryhodnými účastníkmi):", REGISTRATION_CODE)
-    print("POZOR: nahratí Python boti sa spúšťajú na serveri bez sandboxu. Nepripájaj nedôveryhodných používateľov.")
+    print("Bot security: Docker Linux sandbox, isolated per bot, no network, read-only mounts.")
     threading.Thread(target=scheduler, daemon=True).start()
     print(f"Liar's Dice listening on port {port}; http://localhost:{port}")
     ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()
